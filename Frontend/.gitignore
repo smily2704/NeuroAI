@@ -1,0 +1,32 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+dist/
+build/
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Medical data
+backend/uploads/*
+backend/reports/*
+uploads/
+reports/
+
+# Logs
+*.log
+
+# Editor
+.vscode/
