@@ -31,6 +31,9 @@ export default function App() {
       setPageHistory((history) => [...history, page]);
       setPage(nextPage);
     }
+    if (nextPage === "upload") {
+      loadPatients();
+    }
   }
 
   function goBack() {
@@ -55,6 +58,7 @@ export default function App() {
   const [user, setUser] = useState(null);
 
   const [patients, setPatients] = useState([]);
+  const [selectedPatientId, setSelectedPatientId] = useState("");
   const [selectedFile, setSelectedFile] = useState(null);
   const [eegData, setEegData] = useState(null);
   const [babyProfiles, setBabyProfiles] = useState([]);
@@ -238,16 +242,25 @@ export default function App() {
   async function uploadEEG(event) {
     event.preventDefault();
 
+    if (!selectedPatientId) {
+      setMessage("Please select a patient before uploading the EEG.");
+      return;
+    }
+
     if (!selectedFile) {
-      setMessage("Please select a CSV file first.");
+      setMessage("Please select an EEG file first.");
       return;
     }
 
     const formData = new FormData();
+    // IMPORTANT: backend expects Patient.id (internal numeric database ID),
+    // not Patient.patient_id (the human-readable identifier).
+    formData.append("patient_id", String(selectedPatientId));
     formData.append("file", selectedFile);
 
     setLoading(true);
     setMessage("");
+    setEegData(null);
 
     try {
       const response = await fetch(`${API_URL}/eeg/upload`, {
@@ -261,15 +274,25 @@ export default function App() {
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(readableApiError(data.detail ?? data, "EEG upload failed."));
+        throw new Error(
+          readableApiError(data.detail ?? data, "EEG upload failed.")
+        );
       }
 
       setEegData(data);
+      const patient = patients.find(
+        (item) => String(item.id) === String(selectedPatientId)
+      );
       setMessage(
-        "EEG file uploaded. Review the returned data before proceeding."
+        `EEG uploaded successfully for ${patient?.name || `patient ${selectedPatientId}`}.`
       );
     } catch (error) {
-      setMessage(readableApiError(error?.message, "Unable to upload the EEG recording."));
+      setMessage(
+        readableApiError(
+          error?.message,
+          "Unable to upload the EEG recording."
+        )
+      );
     } finally {
       setLoading(false);
     }
@@ -1026,23 +1049,50 @@ export default function App() {
               <span className="eyebrow">EEG WORKSPACE</span>
               <h2>Upload EEG recording</h2>
               <p>
-                Select a CSV file containing EEG samples.
-                The backend must validate the format.
+                Choose the patient first, then select an EDF, CSV, or TSV recording.
               </p>
 
               <form onSubmit={uploadEEG}>
+                <label htmlFor="patient-select">Select patient</label>
+                <select
+                  id="patient-select"
+                  value={selectedPatientId}
+                  onChange={(event) => setSelectedPatientId(event.target.value)}
+                  required
+                >
+                  <option value="">-- Choose a patient --</option>
+                  {patients.map((patient) => (
+                    <option key={patient.id} value={patient.id}>
+                      {patient.name || patient.full_name || "Unnamed patient"} — ID: {patient.patient_id || patient.id}
+                    </option>
+                  ))}
+                </select>
+
+                {patients.length === 0 && (
+                  <div className="notice-box">
+                    No patients loaded. Create a patient first or click the button below.
+                    <button
+                      type="button"
+                      className="primary-button compact"
+                      disabled={loading}
+                      onClick={loadPatients}
+                    >
+                      Refresh patients
+                    </button>
+                  </div>
+                )}
+
                 <label htmlFor="eeg-file">
-                  EEG CSV file
+                  EEG recording (EDF, CSV, or TSV)
                 </label>
 
                 <input
                   id="eeg-file"
                   type="file"
-                  accept=".csv,.tsv,.txt"
+                  accept=".edf,.csv,.tsv"
+                  required
                   onChange={(event) =>
-                    setSelectedFile(
-                      event.target.files?.[0] || null
-                    )
+                    setSelectedFile(event.target.files?.[0] || null)
                   }
                 />
 

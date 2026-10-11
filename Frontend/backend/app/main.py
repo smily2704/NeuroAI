@@ -13,6 +13,7 @@ from .models import User, Patient, EEGRecording, AnalysisResult, DoctorNote, Pre
 from .schemas import LoginInput, PatientCreate, NoteCreate, PrescriptionCreate
 from .security import hash_password, verify_password, create_access_token, current_user, require_doctor
 from .eeg import parse_eeg_csv, signal_quality, channel_stats, frequency_analysis
+import mne
 from .ml_adapter import run_model, model_status
 from .reports import make_report
 
@@ -311,28 +312,120 @@ def recording_dict(r):
             "channels": json.loads(r.channels_json), "sample_count": r.sample_count, "duration_seconds": r.duration_seconds, "created_at": r.created_at}
 
 def load_matrix(recording: EEGRecording):
-    raw = Path(recording.stored_path).read_bytes()
-    channels, matrix, _ = parse_eeg_csv(raw)
-    return channels, matrix
+    """Load a stored CSV/TSV or EDF recording for basic signal analysis."""
+    path = Path(recording.stored_path)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="The stored EEG recording file could not be found.")
+
+    extension = path.suffix.lower()
+    if extension == ".edf":
+        raw = None
+        try:
+            raw = mne.io.read_raw_edf(str(path), preload=True, verbose="ERROR")
+            channels = list(raw.ch_names)
+            matrix = raw.get_data().T  # (samples, channels)
+            if matrix.size == 0 or not channels:
+                raise HTTPException(status_code=400, detail="The EDF file contains no usable signals.")
+            return channels, matrix
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Unable to read EDF recording: {exc}")
+        finally:
+            if raw is not None:
+                raw.close()
+
+    if extension in {".csv", ".tsv"}:
+        channels, matrix, _ = parse_eeg_csv(path.read_bytes())
+        return channels, matrix
+
+    raise HTTPException(status_code=400, detail="Unsupported recording format. Use CSV, TSV, or EDF.")
 
 @app.post("/api/eeg/upload")
-async def upload_eeg(patient_id: int = Form(...), sampling_rate: float | None = Form(None),
-                     file: UploadFile = File(...), user: User = Depends(require_doctor), db: Session = Depends(get_db)):
+async def upload_eeg(
+    patient_id: int = Form(...),
+    sampling_rate: float | None = Form(None),
+    file: UploadFile = File(...),
+    user: User = Depends(require_doctor),
+    db: Session = Depends(get_db),
+):
     patient = db.get(Patient, patient_id)
-    if not patient or patient.owner_doctor_id != user.id: raise HTTPException(404, "Authorized patient not found")
-    if Path(file.filename or "").suffix.lower() not in {".csv", ".tsv"}: raise HTTPException(400, "Only CSV/TSV is enabled in this starter. EDF requires an EDF reader integration.")
+    if not patient or patient.owner_doctor_id != user.id:
+        raise HTTPException(status_code=404, detail="Authorized patient not found.")
+
+    original_name = Path(file.filename or "").name
+    if not original_name:
+        raise HTTPException(status_code=400, detail="Please select a file to upload.")
+
+    extension = Path(original_name).suffix.lower()
+    if extension not in {".csv", ".tsv", ".edf"}:
+        raise HTTPException(status_code=400, detail="Unsupported file format. Upload a CSV, TSV, or EDF file.")
+
     content = await file.read()
-    if len(content) > settings.max_upload_size_mb * 1024 * 1024: raise HTTPException(413, "File exceeds upload size limit")
-    channels, matrix, time_col = parse_eeg_csv(content)
-    safe_name = Path(file.filename or "recording.csv").name
-    destination = UPLOAD_DIR / f"patient{patient.id}_{safe_name}"
+    max_bytes = settings.max_upload_size_mb * 1024 * 1024
+    if not content:
+        raise HTTPException(status_code=400, detail="The selected file is empty.")
+    if len(content) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"File exceeds the {settings.max_upload_size_mb} MB upload limit.")
+
+    # A unique server-side filename prevents overwriting an earlier upload.
+    destination = UPLOAD_DIR / f"patient{patient.id}_{os.urandom(8).hex()}{extension}"
     destination.write_bytes(content)
-    duration = (matrix.shape[0] / sampling_rate) if sampling_rate and sampling_rate > 0 else None
-    rec = EEGRecording(patient_id=patient.id, filename=safe_name, stored_path=str(destination.resolve()), sampling_rate=sampling_rate,
-                       channels_json=json.dumps(channels), sample_count=int(matrix.shape[0]), duration_seconds=duration)
-    db.add(rec); db.commit(); db.refresh(rec)
-    return {"recording": recording_dict(rec), "upload_status": "validated", "time_column_detected": bool(time_col),
-            "signal_quality": signal_quality(matrix, channels), "message": "Uploaded signal parsed. No seizure model has been run."}
+
+    try:
+        if extension == ".edf":
+            raw = None
+            try:
+                raw = mne.io.read_raw_edf(str(destination), preload=True, verbose="ERROR")
+                channels = list(raw.ch_names)
+                matrix = raw.get_data().T
+                detected_rate = float(raw.info["sfreq"])
+                sample_count = int(raw.n_times)
+                duration = sample_count / detected_rate if detected_rate > 0 else None
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"The EDF file could not be read: {exc}")
+            finally:
+                if raw is not None:
+                    raw.close()
+
+            if not channels or matrix.size == 0:
+                raise HTTPException(status_code=400, detail="The EDF file contains no usable signals.")
+            stored_sampling_rate = detected_rate
+            time_col_detected = False
+        else:
+            channels, matrix, time_col = parse_eeg_csv(content)
+            if sampling_rate is not None and sampling_rate <= 0:
+                raise HTTPException(status_code=400, detail="Sampling rate must be greater than zero.")
+            stored_sampling_rate = sampling_rate
+            sample_count = int(matrix.shape[0])
+            duration = sample_count / sampling_rate if sampling_rate else None
+            time_col_detected = bool(time_col)
+
+        rec = EEGRecording(
+            patient_id=patient.id,
+            filename=original_name,
+            stored_path=str(destination.resolve()),
+            sampling_rate=stored_sampling_rate,
+            channels_json=json.dumps(channels),
+            sample_count=sample_count,
+            duration_seconds=duration,
+        )
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
+
+        return {
+            "recording": recording_dict(rec),
+            "upload_status": "validated",
+            "time_column_detected": time_col_detected,
+            "signal_quality": signal_quality(matrix, channels),
+            "message": "Recording uploaded and basic signal checks completed. No seizure-detection model has been run.",
+        }
+    except Exception:
+        db.rollback()
+        if destination.exists():
+            destination.unlink()
+        raise
 
 @app.get("/api/eeg/{recording_id}")
 def get_recording(recording_id: int, user: User = Depends(require_doctor), db: Session = Depends(get_db)):
